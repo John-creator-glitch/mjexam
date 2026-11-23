@@ -1,0 +1,70 @@
+import express from 'express';import crypto from 'node:crypto';import fs from 'node:fs';import path from 'node:path';import {fileURLToPath} from 'node:url';
+const __d=path.dirname(fileURLToPath(import.meta.url));
+const {PORT=3000,DATABASE_URL,SESSION_SECRET,TEACHER_PASSWORD,STUDENT_CODE,ANTHROPIC_API_KEY,MODEL='claude-sonnet-5-5'}=process.env;
+if(!SESSION_SECRET||SESSION_SECRET.length<16){console.error('Set SESSION_SECRET (16+ chars).');process.exit(1)}
+
+async function makeStore(){
+ if(DATABASE_URL){const pg=(await import('pg')).default;
+  const pool=new pg.Pool({connectionString:DATABASE_URL,ssl:/localhost|127\.0\.0\.1/.test(DATABASE_URL)?false:{rejectUnauthorized:false}});
+  await pool.query(fs.readFileSync(path.join(__d,'db/schema.sql'),'utf8'));
+  return{kind:'postgres',
+   async get(p){const r=await pool.query('SELECT data FROM docs WHERE path=$1',[p]);return r.rows[0]?.data??null},
+   async set(p,d){await pool.query('INSERT INTO docs(path,data,updated) VALUES($1,$2,$3) ON CONFLICT(path) DO UPDATE SET data=$2,updated=$3',[p,d,Date.now()])},
+   async list(pre){return (await pool.query('SELECT path,data FROM docs WHERE path LIKE $1',[pre+'%'])).rows},
+   async stamp(pre){return Number((await pool.query('SELECT COALESCE(MAX(updated),0) m FROM docs WHERE path LIKE $1',[pre+'%'])).rows[0].m)}}}
+ const f=path.join(process.env.DATA_DIR||path.join(__d,'data'),'db.json');fs.mkdirSync(path.dirname(f),{recursive:true});
+ let M={};try{M=JSON.parse(fs.readFileSync(f,'utf8'))}catch{}let t;const flush=()=>{clearTimeout(t);t=setTimeout(()=>fs.writeFileSync(f,JSON.stringify(M)),300)};
+ return{kind:'file',async get(p){return M[p]?.data??null},async set(p,d){M[p]={data:d,updated:Date.now()};flush()},
+  async list(pre){return Object.entries(M).filter(([k])=>k.startsWith(pre)).map(([k,v])=>({path:k,data:v.data}))},
+  async stamp(pre){return Math.max(0,...Object.entries(M).filter(([k])=>k.startsWith(pre)).map(([,v])=>v.updated))}}}
+const store=await makeStore();
+
+// ---- auth: signed tokens, no extra dependencies
+const b64=b=>Buffer.from(b).toString('base64url'),sig=s=>crypto.createHmac('sha256',SESSION_SECRET).update(s).digest('base64url');
+const sign=p=>{const s=b64(JSON.stringify(p));return s+'.'+sig(s)};
+function verify(t){try{const[s,g]=String(t).split('.');const a=Buffer.from(sig(s)),b=Buffer.from(g||'');if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return null;const p=JSON.parse(Buffer.from(s,'base64url'));return p.exp>Date.now()?p:null}catch{return null}}
+const same=(a,b)=>{const x=Buffer.from(String(a||'')),y=Buffer.from(String(b||''));return x.length===y.length&&crypto.timingSafeEqual(x,y)};
+const auth=(req,res,next)=>{const u=verify((req.headers.authorization||'').replace(/^Bearer /,''));if(!u)return res.status(401).json({error:'Please sign in'});req.user=u;next()};
+const teacherOnly=(req,res,next)=>req.user.role=='teacher'?next():res.status(403).json({error:'Teacher only'});
+
+const app=express();app.use(express.json({limit:'6mb'}));
+app.get('/api/health',(_q,r)=>r.json({ok:true,db:store.kind}));
+const fails=new Map();
+app.post('/api/login',(req,res)=>{const{role,name,code}=req.body||{},ip=req.ip,n=(fails.get(ip)||[]).filter(t=>Date.now()-t<6e4);
+ if(n.length>=8)return res.status(429).json({error:'Too many attempts. Wait a minute.'});
+ const clean=String(name||'').trim().slice(0,40);
+ if(role=='teacher'){if(!TEACHER_PASSWORD)return res.status(500).json({error:'Server has no TEACHER_PASSWORD'});
+  if(!same(code,TEACHER_PASSWORD)){fails.set(ip,[...n,Date.now()]);return res.status(401).json({error:'Wrong password'})}
+  var me={uid:'teacher',role:'teacher',name:clean||'Teacher'}}
+ else if(role=='student'){if(!STUDENT_CODE)return res.status(500).json({error:'Server has no STUDENT_CODE'});
+  if(!clean)return res.status(400).json({error:'Enter your name'});
+  if(!same(code,STUDENT_CODE)){fails.set(ip,[...n,Date.now()]);return res.status(401).json({error:'Wrong student code'})}
+  me={uid:'s_'+clean.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,30),role:'student',name:clean}}
+ else return res.status(400).json({error:'Choose a role'});
+ res.json({...me,token:sign({...me,exp:Date.now()+7*864e5})})});
+
+// ---- documents (same paths the front-end uses)
+const okPath=p=>/^(teacher|student)\/[A-Za-z0-9_-]{1,60}$/.test(p);
+const canRead=(u,p)=>p.startsWith('teacher/')||u.role=='teacher'||p=='student/'+u.uid;
+const canWrite=(u,p)=>p.startsWith('teacher/')?u.role=='teacher':p=='student/'+u.uid;
+app.get('/api/doc',auth,async(req,res)=>{const p=String(req.query.path||'');if(!okPath(p)||!canRead(req.user,p))return res.status(403).json({error:'Not allowed'});const d=await store.get(p);res.json({exists:d!==null,data:d})});
+app.put('/api/doc',auth,async(req,res)=>{const{path:p,data}=req.body||{};if(!okPath(p)||!canWrite(req.user,p))return res.status(403).json({error:'Not allowed'});if(!data||typeof data!=='object')return res.status(400).json({error:'Bad data'});await store.set(p,data);res.json({ok:true})});
+const okPre=p=>p=='teacher/'||p=='student/';
+app.get('/api/docs',auth,async(req,res)=>{const p=String(req.query.prefix||'');if(!okPre(p)||(p=='student/'&&req.user.role!='teacher'))return res.status(403).json({error:'Not allowed'});res.json({docs:await store.list(p)})});
+app.get('/api/stamp',auth,async(req,res)=>{const p=String(req.query.prefix||'');if(!okPre(p)||(p=='student/'&&req.user.role!='teacher'))return res.status(403).json({error:'Not allowed'});res.json({stamp:await store.stamp(p)})});
+
+// ---- AI proxy: the API key never reaches the browser
+const hits=new Map();
+app.post('/api/ai',auth,async(req,res)=>{const prompt=String(req.body?.prompt||'');if(!prompt||prompt.length>80000)return res.status(400).json({error:'Prompt missing or too long'});
+ if(!ANTHROPIC_API_KEY)return res.status(500).json({error:'Server has no ANTHROPIC_API_KEY'});
+ const h=(hits.get(req.user.uid)||[]).filter(t=>Date.now()-t<6e4);if(h.length>=15)return res.status(429).json({error:'Slow down: too many AI requests this minute'});hits.set(req.user.uid,[...h,Date.now()]);
+ try{const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'x-api-key':ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01','content-type':'application/json'},body:JSON.stringify({model:MODEL,max_tokens:8000,messages:[{role:'user',content:prompt+'\n\nReply with valid JSON only, no markdown fences.'}]})});
+  const j=await r.json();if(!r.ok)return res.status(502).json({error:j.error?.message||'AI request failed'});
+  const t=(j.content||[]).map(c=>c.text||'').join('');const a=t.indexOf('{'),b=t.lastIndexOf('}');
+  try{res.json({data:JSON.parse(t.slice(a,b+1))})}catch{res.status(502).json({error:'AI returned invalid JSON. Try again.'})}}
+ catch(e){res.status(502).json({error:'AI service unreachable'})}});
+
+const PUBLIC_DIR=path.join(__d,'public');
+app.use(express.static(PUBLIC_DIR));
+app.get('/',(_q,r)=>r.sendFile(path.join(PUBLIC_DIR,'index.html')));
+app.listen(PORT,()=>console.log(`Exam portal listening on ${PORT} (db: ${store.kind})`));

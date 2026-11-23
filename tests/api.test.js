@@ -1,0 +1,23 @@
+import test,{before,after} from 'node:test';import assert from 'node:assert';import {spawn} from 'node:child_process';import os from 'node:os';import fs from 'node:fs';import path from 'node:path';
+const P=3917,U=`http://localhost:${P}`;let srv;
+const j=async(p,o={},t)=>{const r=await fetch(U+p,{...o,headers:{'Content-Type':'application/json',...(t?{Authorization:'Bearer '+t}:{})}});return{s:r.status,b:await r.json().catch(()=>({}))}};
+before(async()=>{srv=spawn('node',['server.js'],{env:{PATH:process.env.PATH,PORT:P,SESSION_SECRET:'x'.repeat(32),TEACHER_PASSWORD:'tp',STUDENT_CODE:'sc',DATA_DIR:fs.mkdtempSync(path.join(os.tmpdir(),'xp-'))}});
+ await new Promise(r=>srv.stdout.on('data',d=>/listening/.test(d)&&r()))});
+after(()=>srv.kill());
+test('wrong password rejected',async()=>assert.equal((await j('/api/login',{method:'POST',body:JSON.stringify({role:'teacher',code:'no'})})).s,401));
+test('docs and permissions',async()=>{
+ const T=(await j('/api/login',{method:'POST',body:JSON.stringify({role:'teacher',code:'tp'})})).b.token;
+ const A=(await j('/api/login',{method:'POST',body:JSON.stringify({role:'student',name:'Ayesha',code:'sc'})})).b;
+ const B=(await j('/api/login',{method:'POST',body:JSON.stringify({role:'student',name:'Bilal',code:'sc'})})).b;
+ assert.equal((await j('/api/doc',{method:'PUT',body:JSON.stringify({path:'teacher/meta',data:{n:1}})},A.token)).s,403,'student cannot write teacher');
+ assert.equal((await j('/api/doc',{method:'PUT',body:JSON.stringify({path:'teacher/meta',data:{n:1}})},T)).s,200);
+ assert.equal((await j('/api/doc?path=teacher/meta',{},A.token)).b.data.n,1,'student can read teacher');
+ assert.equal((await j('/api/doc',{method:'PUT',body:JSON.stringify({path:'student/'+A.uid,data:{j:'x'}})},A.token)).s,200);
+ assert.equal((await j('/api/doc',{method:'PUT',body:JSON.stringify({path:'student/'+A.uid,data:{j:'hack'}})},B.token)).s,403,'cannot write another student');
+ assert.equal((await j('/api/doc?path=student/'+A.uid,{},B.token)).s,403,'cannot read another student');
+ assert.equal((await j('/api/docs?prefix=student/',{},A.token)).s,403);
+ assert.equal((await j('/api/docs?prefix=student/',{},T)).b.docs.length,1,'teacher lists students');
+ assert.equal((await j('/api/doc?path=../etc',{},T)).s,403);
+ assert.equal((await j('/api/doc',{})).s,401,'no token');
+ assert.equal((await j('/api/ai',{method:'POST',body:JSON.stringify({prompt:'hi'})},A.token)).s,500,'no AI key configured');
+});

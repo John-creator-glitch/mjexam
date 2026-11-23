@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: exam-prep-portal
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - {key: DATABASE_URL, sync: false}
+      - {key: SESSION_SECRET, generateValue: true}
+      - {key: TEACHER_PASSWORD, sync: false}
+      - {key: STUDENT_CODE, sync: false}
+      - {key: ANTHROPIC_API_KEY, sync: false}
+      - {key: MODEL, value: claude-sonnet-5-5}
